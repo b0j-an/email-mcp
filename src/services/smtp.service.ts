@@ -7,8 +7,9 @@
 import { randomUUID } from 'node:crypto';
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
-import type { AccountConfig, SendResult } from '../types/index.js';
-import { buildRawMessage } from '../utils/mail-message.js';
+import { MAX_ATTACHMENT_SIZE, validateAttachments } from '../safety/validation.js';
+import type { AccountConfig, AttachmentInput, SendResult } from '../types/index.js';
+import { buildRawMessage, resolveAttachments } from '../utils/mail-attachments.js';
 import type ImapService from './imap.service.js';
 
 interface OutgoingMailFields {
@@ -20,6 +21,7 @@ interface OutgoingMailFields {
   html?: string;
   inReplyTo?: string;
   references?: string;
+  attachments?: AttachmentInput[];
 }
 
 export default class SmtpService {
@@ -42,9 +44,12 @@ export default class SmtpService {
       cc?: string[];
       bcc?: string[];
       html?: boolean;
+      attachments?: AttachmentInput[];
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
+    validateAttachments(options.attachments);
+
     const account = this.connections.getAccount(accountName);
 
     return this.composeSendAndArchive(accountName, account, {
@@ -52,6 +57,7 @@ export default class SmtpService {
       cc: options.cc,
       bcc: options.bcc,
       subject: options.subject,
+      attachments: options.attachments,
       ...(options.html ? { html: options.body } : { text: options.body }),
     });
   }
@@ -68,9 +74,11 @@ export default class SmtpService {
       body: string;
       replyAll?: boolean;
       html?: boolean;
+      attachments?: AttachmentInput[];
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
+    validateAttachments(options.attachments);
 
     const account = this.connections.getAccount(accountName);
     const original = await this.imapService.getEmail(accountName, options.emailId, options.mailbox);
@@ -107,6 +115,7 @@ export default class SmtpService {
       subject,
       inReplyTo: original.messageId,
       references: references.join(' '),
+      attachments: options.attachments,
       ...(options.html ? { html: options.body } : { text: options.body }),
     });
   }
@@ -123,12 +132,16 @@ export default class SmtpService {
       to: string[];
       body?: string;
       cc?: string[];
+      attachments?: AttachmentInput[];
+      includeOriginalAttachments?: boolean;
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
+    validateAttachments(options.attachments);
 
     const account = this.connections.getAccount(accountName);
-    const original = await this.imapService.getEmail(accountName, options.emailId, options.mailbox);
+    const mailbox = options.mailbox ?? 'INBOX';
+    const original = await this.imapService.getEmail(accountName, options.emailId, mailbox);
 
     const subject = original.subject.startsWith('Fwd:')
       ? original.subject
@@ -148,11 +161,38 @@ export default class SmtpService {
     const originalBody = original.bodyText ?? original.bodyHtml ?? '';
     const fullBody = (options.body ?? '') + forwardHeader + originalBody;
 
+    let originalAttachments: AttachmentInput[] = [];
+    if (options.includeOriginalAttachments && original.attachments.length > 0) {
+      const totalOriginalSize = original.attachments.reduce((sum, a) => sum + a.size, 0);
+      if (totalOriginalSize > MAX_ATTACHMENT_SIZE) {
+        throw new Error(
+          `Original email's attachments (${Math.round(totalOriginalSize / 1024 / 1024)}MB) exceed the ${MAX_ATTACHMENT_SIZE / 1024 / 1024}MB per-file limit; forward without includeOriginalAttachments and attach selectively instead`,
+        );
+      }
+      originalAttachments = await Promise.all(
+        original.attachments.map(async (meta) => {
+          const downloaded = await this.imapService.downloadAttachment(
+            accountName,
+            options.emailId,
+            mailbox,
+            meta.filename,
+            MAX_ATTACHMENT_SIZE,
+          );
+          return {
+            filename: downloaded.filename,
+            content: downloaded.contentBase64,
+            contentType: downloaded.mimeType,
+          };
+        }),
+      );
+    }
+
     return this.composeSendAndArchive(accountName, account, {
       to: options.to,
       cc: options.cc,
       subject,
       text: fullBody,
+      attachments: [...originalAttachments, ...(options.attachments ?? [])],
     });
   }
 
@@ -185,6 +225,23 @@ export default class SmtpService {
 
     const account = this.connections.getAccount(accountName);
 
+    const draftAttachments: AttachmentInput[] = await Promise.all(
+      draft.attachments.map(async (meta) => {
+        const downloaded = await this.imapService.downloadAttachment(
+          accountName,
+          String(draftId),
+          draftsPath,
+          meta.filename,
+          MAX_ATTACHMENT_SIZE,
+        );
+        return {
+          filename: downloaded.filename,
+          content: downloaded.contentBase64,
+          contentType: downloaded.mimeType,
+        };
+      }),
+    );
+
     const result = await this.composeSendAndArchive(accountName, account, {
       to: draft.to.map((a) => a.address),
       cc: draft.cc?.map((a) => a.address),
@@ -192,6 +249,7 @@ export default class SmtpService {
       subject: draft.subject,
       inReplyTo: draft.inReplyTo,
       references: draft.references?.join(' '),
+      attachments: draftAttachments,
       ...(draft.bodyHtml ? { html: draft.bodyHtml } : { text: draft.bodyText ?? '' }),
     });
 
@@ -223,6 +281,7 @@ export default class SmtpService {
     const domain = account.email.split('@')[1] ?? 'localhost';
     const messageId = `<${randomUUID()}@${domain}>`;
     const from = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
+    const attachments = await resolveAttachments(fields.attachments);
 
     const raw = await buildRawMessage({
       from,
@@ -235,6 +294,7 @@ export default class SmtpService {
       inReplyTo: fields.inReplyTo,
       references: fields.references,
       messageId,
+      attachments,
     });
 
     const envelope = {
